@@ -187,7 +187,7 @@ class Child:
                 score += 5
             if nxt == "校场":
                 score += self.interests["martial"] * 0.6
-                score += self.hidden["courage"] * 0.2
+                score += self.visible["courage"] * 0.2
             if nxt == "御花园":
                 score += self.needs["stress"] * 0.45
                 score += self.interests["play"] * 0.4
