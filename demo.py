@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # ===== 像素字符合集 =====
@@ -99,6 +100,22 @@ EVENT_POOL: Dict[str, List[str]] = {
         "{name}把今日所见写进日记，没对他人提起。",
         "{name}在居所里自言自语，像在构思什么。",
     ],
+}
+
+ROLE_COOLDOWN = {
+    "太傅": {"辅导": 2, "训诫": 3},
+    "武师": {"加训": 1, "体能修整": 2},
+    "母妃": {"安抚": 1, "夜谈": 2},
+    "太监": {"密查": 1, "警示": 2},
+    "皇帝": {
+        "召见": 1,
+        "夸奖": 1,
+        "责罚": 2,
+        "赐书": 2,
+        "赐剑": 2,
+        "放宽宫规": 3,
+        "加严宫规": 2,
+    },
 }
 
 
@@ -275,7 +292,15 @@ class GameState:
         "allow_outside": False,
     })
     reports: List[Report] = field(default_factory=list)
+    log_path: Optional[str] = None
     open_locations: Dict[str, bool] = field(default_factory=lambda: {name: True for name in LOCATION_SYMBOL})
+    role_cooldowns: Dict[str, int] = field(default_factory=lambda: {
+        "皇帝": 0,
+        "太傅": 0,
+        "武师": 0,
+        "母妃": 0,
+        "太监": 0,
+    })
 
     def today_stamp(self) -> str:
         return f"第{self.day:03d}日"
@@ -302,6 +327,274 @@ class GameState:
             f"智={c.visible['wisdom']:>3d} 武={c.visible['martial']:>3d} 政={c.visible['politics']:>3d} "
             f"信任={rel_emperor['信任']:>3d} 亲近={rel_emperor['亲近']:>3d}"
         )
+
+
+def snapshot_child_state(child: Child) -> Dict[str, object]:
+    return {
+        "visible": dict(child.visible),
+        "hidden": dict(child.hidden),
+        "needs": dict(child.needs),
+        "relations": {k: dict(v) for k, v in child.relationships.items()},
+        "mood": child.mood,
+        "location": child.location,
+        "age": child.age,
+    }
+
+
+def diff_simple(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
+    delta: Dict[str, int] = {}
+    for k in set(before.keys()) | set(after.keys()):
+        b = before.get(k)
+        a = after.get(k)
+        if b is not None and a is not None and b != a:
+            delta[k] = a - b
+    return delta
+
+
+def diff_relations(before: Dict[str, Dict[str, int]], after: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+    for person in set(before.keys()) | set(after.keys()):
+        b = before.get(person, {})
+        a = after.get(person, {})
+        d = diff_simple(b, a)
+        if d:
+            out[person] = d
+    return out
+
+
+def diff_child_state(before: Dict[str, object], after: Dict[str, object]) -> Dict[str, Dict[str, int]]:
+    return {
+        "visible": diff_simple(before["visible"], after["visible"]),
+        "hidden": diff_simple(before["hidden"], after["hidden"]),
+        "needs": diff_simple(before["needs"], after["needs"]),
+        "relations": diff_relations(before["relations"], after["relations"]),
+        "location_changed": before["location"] != after["location"],
+        "location_before": before["location"],
+        "location_after": after["location"],
+    }
+
+
+def format_delta_line(prefix: str, delta: Dict[str, int]) -> List[str]:
+    lines = []
+    for k, v in delta.items():
+        if v > 0:
+            lines.append(f" {prefix}{k} +{v}")
+        else:
+            lines.append(f" {prefix}{k} {v}")
+    return lines
+
+
+def append_log(game: GameState, record: Dict[str, object]) -> None:
+    if not game.log_path:
+        return
+    with open(game.log_path, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(record, ensure_ascii=False))
+        fp.write("\n")
+
+
+def reduce_role_cooldowns(game: GameState) -> None:
+    for role in list(game.role_cooldowns.keys()):
+        if game.role_cooldowns[role] > 0:
+            game.role_cooldowns[role] -= 1
+
+
+def build_role_candidate_actions(game: GameState) -> List[Dict[str, object]]:
+    if not game.children:
+        return []
+
+    candidates: List[Dict[str, object]] = []
+    stress_top = sorted(game.children, key=lambda c: c.needs["stress"], reverse=True)[0]
+    lonely_top = sorted(game.children, key=lambda c: c.needs["lonely"], reverse=True)[0]
+    martial_top = sorted(game.children, key=lambda c: c.visible["martial"])[0]
+    jealousy_top = sorted(game.children, key=lambda c: c.hidden["jealousy"], reverse=True)[0]
+    ambition_top = sorted(game.children, key=lambda c: c.hidden["ambition"], reverse=True)[0]
+
+    def append_candidate(role: str, action: str, target: Child, desc: str, urgency: int, extra: Dict[str, int] | None = None) -> None:
+        if game.role_cooldowns.get(role, 0) > 0:
+            return
+        candidates.append({
+            "type": "option",
+            "role": role,
+            "action": action,
+            "target": target.cid,
+            "description": desc,
+            "urgency": urgency,
+            "cooldown": ROLE_COOLDOWN.get(role, {}).get(action, 1),
+            "meta": extra or {},
+        })
+
+    # 皇帝分支
+    if stress_top.needs["stress"] >= 72:
+        append_candidate("皇帝", "召见", stress_top, f"皇帝亲赴{stress_top.name}安抚，快速降压", 95)
+    elif stress_top.needs["stress"] >= 58 and game.policy["strict_gate"]:
+        append_candidate("皇帝", "加严宫规", stress_top, "持续高压，皇帝加严宫规防止离经叛道", 75)
+    else:
+        append_candidate("皇帝", "放宽宫规", stress_top, "局势平稳，临时放宽部分宫规以减压", 25)
+
+    if stress_top.needs["stress"] <= 35 and stress_top.visible["wisdom"] < 55:
+        append_candidate("皇帝", "夸奖", stress_top, f"{stress_top.name}表现平稳，赠予公开夸奖", 30)
+
+    if ambition_top.hidden["ambition"] >= 65 and ambition_top.visible["martial"] < 60 and ambition_top.needs["stress"] >= 55:
+        append_candidate("皇帝", "赐剑", ambition_top, f"以礼赐{ambition_top.name}一柄练兵用剑，化解其攻伐心理", 60)
+
+    if stress_top.visible["wisdom"] < 40:
+        append_candidate("皇帝", "赐书", stress_top, f"命令书房下发功课文稿，扶助{stress_top.name}读书", 40)
+
+    # 太傅分支
+    if stress_top.needs["stress"] >= 60:
+        append_candidate("太傅", "辅导", stress_top, f"太傅请{stress_top.name}复盘今日学习内容，安定情绪", 70)
+    if wisdom_candidates := [c for c in game.children if c.visible["wisdom"] < 45 and c.needs["stress"] >= 40]:
+        wisdom_candidates.sort(key=lambda c: c.visible["wisdom"])
+        append_candidate("太傅", "训诫", wisdom_candidates[0], f"{wisdom_candidates[0].name}最近偷懒，太傅以严师教导", 45)
+
+    # 武师分支
+    if martial_top.visible["martial"] < 45:
+        append_candidate("武师", "加训", martial_top, f"安排{martial_top.name}强化体能和持久力训练", 55)
+    if stress_top.needs["stress"] >= 65:
+        append_candidate("武师", "体能修整", stress_top, f"{stress_top.name}近两日过于紧绷，改为低强度训练", 40)
+
+    # 母妃分支
+    if lonely_top.needs["lonely"] >= 55:
+        append_candidate("母妃", "安抚", lonely_top, f"母妃以言语安抚{lonely_top.name}，缓解离群感", 72)
+    if emotion_candidates := [c for c in game.children if c.mood in ("焦躁", "平常") and c.needs["stress"] > 45]:
+        emotion_candidates.sort(key=lambda c: c.needs["stress"], reverse=True)
+        append_candidate("母妃", "夜谈", emotion_candidates[0], f"母妃深夜探望{emotion_candidates[0].name}，以长辈口吻开导", 50)
+
+    # 太监分支
+    if any(c.needs["stress"] > 70 for c in game.children):
+        append_candidate("太监", "密查", stress_top, f"太监查明{stress_top.name}近况，记录可疑动向", 65)
+    if jealousy_top.hidden["jealousy"] >= 55:
+        append_candidate("太监", "警示", jealousy_top, f"太监提醒{jealousy_top.name}近期与同列互动频繁，保持礼数", 58)
+
+    # 生成稳定性：至少留一个低风险行为，避免无动作
+    if not candidates:
+        append_candidate("皇帝", "放宽宫规", game.children[0], "临时维持观望政策", 10)
+
+    # 去重：同角色同动作同目标保底不会重复
+    unique: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+    for c in candidates:
+        unique[(c["role"], c["action"], c["target"])] = c
+    filtered = list(unique.values())
+    filtered.sort(key=lambda c: c["urgency"], reverse=True)
+    return filtered[:4]
+
+
+def execute_role_action(game: GameState, option: Dict[str, object]) -> str:
+    role = option["role"]
+    action = option["action"]
+    target_cid = option["target"]
+    target = next((c for c in game.children if c.cid == target_cid), None)
+
+    if not target:
+        return "无效目标，未执行"
+
+    note = f"{role}{action} -> {target.name}"
+    if role == "皇帝":
+        if action == "召见":
+            target.adjust_relation("皇帝", {"亲近": 8, "信任": 6, "敌意": -2})
+            target.needs["lonely"] = max(0, target.needs["lonely"] - 10)
+            target.needs["stress"] = max(0, target.needs["stress"] - 8)
+            target.hidden["security"] += 7
+            target.mood = "平稳"
+            note = f"皇帝召见{target.name}，压下压力"
+        elif action == "夸奖":
+            target.visible["wisdom"] += 2
+            target.hidden["self_esteem"] += 8
+            target.adjust_relation("皇帝", {"亲近": 6, "信任": 4})
+            target.mood = "平稳"
+            note = f"皇帝公开夸奖{target.name}，提升士气"
+        elif action == "责罚":
+            target.needs["stress"] += 10
+            target.hidden["self_esteem"] -= 6
+            target.adjust_relation("皇帝", {"信任": -6, "敌意": 4})
+            target.mood = "焦躁"
+            note = f"皇帝严责{target.name}，纪律收紧"
+        elif action == "赐书":
+            target.interests["study"] += 5
+            target.visible["wisdom"] += 3
+            target.hidden["obedience"] += 3
+            note = f"皇帝赐书助{target.name}进修"
+        elif action == "赐剑":
+            target.interests["martial"] += 6
+            target.visible["martial"] += 3
+            target.visible["courage"] += 2
+            target.hidden["ambition"] += 2
+            note = f"皇帝赐剑予{target.name}，意图导向武道"
+        elif action == "放宽宫规":
+            game.policy["strict_gate"] = False
+            target.adjust_relation("皇帝", {"信任": 2, "敌意": -2})
+            note = "皇帝临时放宽宫规，宫中氛围回缓"
+        elif action == "加严宫规":
+            game.policy["strict_gate"] = True
+            for c in game.children:
+                c.hidden["obedience"] += 2
+                c.needs["stress"] = min(100, c.needs["stress"] + 2)
+            note = "皇帝加严宫规，宫规执行更严格"
+        else:
+            note = f"皇帝暂时观望{target.name}"
+
+    elif role == "太傅":
+        if action == "辅导":
+            target.apply_deltas({"wisdom": 3, "prestige": 1})
+            target.needs["stress"] = max(0, target.needs["stress"] - 6)
+            target.hidden["obedience"] += 4
+            target.adjust_relation("太傅", {"亲近": 6, "信任": 4})
+            note = f"太傅对{target.name}进行课后辅导"
+        elif action == "训诫":
+            target.apply_deltas({"wisdom": 2})
+            target.needs["stress"] += 4
+            target.hidden["obedience"] += 2
+            target.adjust_relation("太傅", {"亲近": -1, "信任": -1})
+            note = f"太傅严加训诫{target.name}"
+        else:
+            note = f"太傅维持观察{target.name}"
+
+    elif role == "武师":
+        if action == "加训":
+            target.apply_deltas({"martial": 5, "courage": 2})
+            target.needs["stress"] = min(100, target.needs["stress"] + 6)
+            target.needs["energy"] = max(0, target.needs["energy"] - 10)
+            target.adjust_relation("武师", {"亲近": 3, "信任": 2})
+            note = f"武师安排{target.name}强化训练"
+        elif action == "体能修整":
+            target.needs["stress"] = max(0, target.needs["stress"] - 4)
+            target.needs["energy"] = min(100, target.needs["energy"] + 5)
+            target.adjust_relation("武师", {"亲近": 2})
+            note = f"武师改为{target.name}轻量体能修整"
+        else:
+            note = f"武师今日不改训练{target.name}"
+
+    elif role == "母妃":
+        if action == "安抚":
+            target.needs["lonely"] = max(0, target.needs["lonely"] - 10)
+            target.needs["stress"] = max(0, target.needs["stress"] - 7)
+            target.hidden["security"] += 6
+            target.adjust_relation("母妃", {"亲近": 8, "信任": 4, "依赖": 4})
+            note = f"母妃安抚{target.name}，孤独感下降"
+        elif action == "夜谈":
+            target.needs["stress"] = max(0, target.needs["stress"] - 5)
+            target.hidden["family_need"] = max(0, target.hidden["family_need"] - 3)
+            target.adjust_relation("母妃", {"亲近": 4, "信任": 2})
+            note = f"母妃夜谈{target.name}，心理波动缓解"
+        else:
+            note = f"母妃未调整{target.name}"
+
+    elif role == "太监":
+        if action == "密查":
+            target.needs["stress"] += 3
+            target.adjust_relation("皇帝", {"信任": -1, "敌意": 2})
+            target.hidden["security"] = max(0, target.hidden["security"] - 4)
+            note = f"太监密查{target.name}近日行为，发现有波动"
+        elif action == "警示":
+            target.adjust_relation("皇帝", {"信任": 1, "敌意": 2})
+            target.adjust_relation(target.cid, {"嫉妒": -3})
+            note = f"太监对{target.name}做出轻度警示"
+        else:
+            note = f"太监今日未动{target.name}"
+
+    _clamp_child(target)
+    game.role_cooldowns[role] = option["cooldown"]
+    return note
 
 
 def render_map(game: GameState) -> str:
@@ -663,106 +956,42 @@ def process_delayed_memories(game: GameState, child: Child) -> List[str]:
     return events
 
 
-def apply_intervention_interactive(game: GameState, child_lookup: Dict[str, Child]) -> str:
-    print("\n皇帝可干预（1次）")
-    print("0=不干预, 1=召见, 2=夸奖, 3=责罚, 4=赐书, 5=赐剑, 6=放宽宫规, 7=加严宫规")
-    try:
-        choice = input("输入编号: ").strip()
-    except EOFError:
-        return "不干预"
+def apply_intervention_interactive(game: GameState, options: Optional[List[Dict[str, object]]] = None) -> str:
+    if options is None:
+        options = build_role_candidate_actions(game)
+    print(f"\n今日可下达 {len(options)} 条权责令:")
+    if not options:
+        print("  当前无可执行建议。")
+        return "未执行任何干预"
 
-    if choice == "0" or choice == "":
-        return "不干预"
+    for idx, opt in enumerate(options, 1):
+        cd = opt["cooldown"]
+        print(f"  {idx}. [{opt['role']}] {opt['description']}（冷却 {cd} 天）")
+    print("  0. 放弃干预")
 
-    if choice in {"6", "7"}:
-        if choice == "6":
-            game.policy["strict_gate"] = False
-            return "放宽宫规"
-        game.policy["strict_gate"] = True
-        return "加严宫规"
-
-    if choice not in {"1", "2", "3", "4", "5"}:
-        return "不干预"
-
-    name = input("选择对象（大皇子/二皇子/三公主）: ").strip()
-    target = child_lookup.get(name)
-    if not target:
-        return "不干预"
-
-    if choice == "1":
-        target.adjust_relation("皇帝", {"亲近": 8, "信任": 6, "敌意": -2})
-        target.hidden["security"] += 6
-        target.needs["lonely"] = max(0, target.needs["lonely"] - 10)
-        target.needs["stress"] = max(0, target.needs["stress"] - 5)
-        target.mood = "平稳"
-        target.history.append(f"被皇帝召见，气氛融洽。")
-        return f"召见{target.name}"
-
-    if choice == "2":
-        target.hidden["self_esteem"] += 8
-        target.visible["wisdom"] += 2
-        target.adjust_relation("皇帝", {"亲近": 6, "信任": 4})
-        target.history.append("受到皇帝夸奖。")
-        return f"夸奖{target.name}"
-
-    if choice == "3":
-        target.needs["stress"] += 10
-        target.hidden["self_esteem"] -= 6
-        target.adjust_relation("皇帝", {"信任": -6, "敌意": 4})
-        target.history.append("遭到皇帝责罚。")
-        return f"责罚{target.name}"
-
-    if choice == "4":
-        target.interests["study"] += 5
-        target.visible["wisdom"] += 2
-        target.hidden["obedience"] += 3
-        target.history.append("获得皇帝赐书。")
-        return f"赐书给{target.name}"
-
-    if choice == "5":
-        target.interests["martial"] += 7
-        target.visible["martial"] += 2
-        target.visible["courage"] += 2
-        target.history.append("获得皇帝赐剑。")
-        return f"赐剑给{target.name}"
-
-    return "不干预"
+    while True:
+        try:
+            raw = input("输入编号: ").strip()
+        except EOFError:
+            raw = "0"
+        if raw in {"", "0"}:
+            return "未执行任何干预"
+        if not raw.isdigit():
+            print("请输入数字编号。")
+            continue
+        choice = int(raw)
+        if choice < 1 or choice > len(options):
+            print("编号超出范围。")
+            continue
+        return execute_role_action(game, options[choice - 1])
 
 
-def apply_intervention_auto(game: GameState, child_lookup: Dict[str, Child]) -> str:
-    # 简化自动策略：优先处理压力高的孩子，防止系统崩坏
-    target = sorted(game.children, key=lambda c: c.needs["stress"], reverse=True)[0]
-
-    # 严重应激：优先召见
-    if target.needs["stress"] > 75:
-        target.adjust_relation("皇帝", {"亲近": 6, "信任": 4, "敌意": -2})
-        target.needs["stress"] = max(0, target.needs["stress"] - 8)
-        target.needs["lonely"] = max(0, target.needs["lonely"] - 4)
-        target.hidden["security"] += 4
-        return f"自动: 召见{target.name}缓解压力"
-
-    # 争强且高目标：少量鼓励以免激进
-    if target.hidden["ambition"] > 65 and target.visible["martial"] < 55 and target.needs["stress"] > 50:
-        target.interests["martial"] += 2
-        target.visible["courage"] += 1
-        target.history.append("皇帝赐剑，化解野性。")
-        return f"自动: 赐剑{target.name}"
-
-    # 常态：大皇子偶尔夸奖以维持稳定感
-    if game.rng.random() < 0.2:
-        target = child_lookup["大皇子"]
-        target.hidden["self_esteem"] += 3
-        target.adjust_relation("皇帝", {"亲近": 2, "信任": 2})
-        return f"自动: 夸奖{target.name}"
-
-    # 随机微观策略
-    if game.rng.random() < 0.15:
-        target = game.rng.choice(game.children)
-        target.needs["stress"] += 6
-        target.adjust_relation("皇帝", {"信任": -2, "敌意": 2})
-        return f"自动: 责罚{target.name}（高压）"
-
-    return "不干预"
+def apply_intervention_auto(game: GameState, options: Optional[List[Dict[str, object]]] = None) -> str:
+    if options is None:
+        options = build_role_candidate_actions(game)
+    if not options:
+        return "未执行任何干预"
+    return execute_role_action(game, options[0])
 
 
 def resolve_route(child: Child) -> str:
@@ -794,6 +1023,7 @@ def print_reports(game: GameState, reports: List[Report], child: Child) -> None:
 
 def day_step(game: GameState, interactive: bool) -> None:
     # 每日开始：轻微自然恢复
+    reduce_role_cooldowns(game)
     for c in game.children:
         c.state = "平稳"
         c.needs["energy"] = min(100, c.needs["energy"] + 20)
@@ -803,6 +1033,8 @@ def day_step(game: GameState, interactive: bool) -> None:
     # 1) 孩子行动
     day_events = []
     for c in game.children:
+        before = snapshot_child_state(c)
+
         # 决策
         dest = c.choose_destination(game.rng, game.day, game.open_locations, game.policy)
         c.location = dest
@@ -826,7 +1058,36 @@ def day_step(game: GameState, interactive: bool) -> None:
 
         c.memories.extend(new_memories)
 
-        day_events.append((c, action, logs, events))
+        after = snapshot_child_state(c)
+        action_delta = diff_child_state(before, after)
+
+        day_events.append({
+            "child": c,
+            "action": action,
+            "from": before["location"],
+            "to": after["location"],
+            "before": before,
+            "after": after,
+            "delta": action_delta,
+            "logs": logs,
+            "events": events,
+            "memories": [mem.__dict__.copy() for mem in new_memories],
+        })
+
+    append_log(game, {
+        "type": "day_start",
+        "day": game.day,
+        "children": [
+            {
+                "name": c.cid,
+                "location": c.location,
+                "needs": dict(c.needs),
+                "visible": dict(c.visible),
+                "mood": c.mood,
+            }
+            for c in game.children
+        ],
+    })
 
     # 2) 生成今日奏报
     print(f"\n{'=' * 40}")
@@ -837,21 +1098,120 @@ def day_step(game: GameState, interactive: bool) -> None:
         print(game.character_panel(c))
 
     # 只做核心的简化展示：挑一个有更多事件的孩子展示完整
-    for c, action, logs, events in day_events:
-        c.history.extend(events)
+    for item in day_events:
+        item["child"].history.extend(item["events"])
 
-    for c in game.children:
-        print(f"\n{c.name}今日行动：{c.location} / {c.history[-1] if c.history else '无显著事件'}")
-        rpt = generate_reports(game, c, c.history[-3:])
+    for item in day_events:
+        c = item["child"]
+        print(f"\n{c.name}今日行动：{c.location} / {item['action']}")
+        before_state = item["before"]
+        after_state = item["after"]
+
+        print(f"  出发地/目的地: {item['from']} -> {item['to']}，动作={item['action']}")
+        print(f"  即时事件:")
+        for e in item["logs"] + item["events"]:
+            print(f"    - {e}")
+
+        delta = item["delta"]
+        if delta["location_changed"]:
+            print(f"  位置: {delta['location_before']} -> {delta['location_after']}")
+        for category, keys in [
+            ("可见属性", "visible"),
+            ("隐藏倾向", "hidden"),
+            ("状态", "needs"),
+        ]:
+            changes = delta[keys]
+            if changes:
+                print(f"  {category}变化:")
+                for k, v in changes.items():
+                    print(f"    {k}: {before_state[keys][k]} -> {after_state[keys][k]} ({v:+d})")
+        relation_delta = delta["relations"]
+        if relation_delta:
+            print("  关系变化:")
+            for who, vals in relation_delta.items():
+                print(f"    {who}:")
+                for k, v in vals.items():
+                    print(f"      {k}: {v:+d}")
+
+        # 记录每个孩子的结构化日志
+        append_log(game, {
+            "type": "day_child",
+            "day": game.day,
+            "name": c.name,
+            "from": item["from"],
+            "to": item["to"],
+            "action": item["action"],
+            "events": item["logs"] + item["events"],
+            "delta": {
+                "visible": delta["visible"],
+                "hidden": delta["hidden"],
+                "needs": delta["needs"],
+                "relations": delta["relations"],
+            },
+            "location_changed": delta["location_changed"],
+            "memory_new": item["memories"],
+            "before": {
+                "needs": before_state["needs"],
+                "visible": before_state["visible"],
+                "hidden": before_state["hidden"],
+                "mood": before_state["mood"],
+                "location": before_state["location"],
+            },
+            "after": {
+                "needs": after_state["needs"],
+                "visible": after_state["visible"],
+                "hidden": after_state["hidden"],
+                "mood": after_state["mood"],
+                "location": after_state["location"],
+            },
+        })
+
+        rpt = generate_reports(game, c, item["logs"] + item["events"])
         game.reports.extend(rpt)
         print_reports(game, rpt, c)
+        append_log(game, {
+            "type": "day_reports",
+            "day": game.day,
+            "name": c.name,
+            "reports": [
+                {
+                    "source": r.source,
+                    "text": r.text,
+                    "truth": r.truth,
+                    "symbol": r.source_symbol,
+                }
+                for r in rpt
+            ],
+        })
 
-    # 3) 今日玩家干预
-    lookup = {"大皇子": game.children[0], "二皇子": game.children[1], "三公主": game.children[2]}
+    # 3) 今日干预（事件卡）
+    options = build_role_candidate_actions(game)
+    append_log(game, {
+        "type": "day_options",
+        "day": game.day,
+        "options": [
+            {
+                "role": c["role"],
+                "action": c["action"],
+                "target": c["target"],
+                "desc": c["description"],
+                "urgency": c["urgency"],
+                "cooldown": c["cooldown"],
+            }
+            for c in options
+        ],
+    })
+
     if interactive:
-        note = apply_intervention_interactive(game, lookup)
+        note = apply_intervention_interactive(game, options)
     else:
-        note = apply_intervention_auto(game, lookup)
+        note = apply_intervention_auto(game, options)
+    append_log(game, {
+        "type": "day_action",
+        "day": game.day,
+        "action": note,
+        "options_count": len(options),
+    })
     print(f"皇帝行动: {note}")
 
     # 行动点副作用：加严宫规会加大孩子压力/降低出宫事件
@@ -879,13 +1239,58 @@ def day_step(game: GameState, interactive: bool) -> None:
         _clamp_child(c)
 
     game.day += 1
+    append_log(game, {
+        "type": "day_end",
+        "day": game.day - 1,
+        "children": [
+            {
+                "name": c.cid,
+                "location": c.location,
+                "needs": dict(c.needs),
+                "visible": dict(c.visible),
+                "mood": c.mood,
+                "relation_emperor": {
+                    "亲近": c.relation("皇帝").get("亲近", 0),
+                    "信任": c.relation("皇帝").get("信任", 0),
+                },
+            }
+            for c in game.children
+        ],
+    })
+    append_log(game, {
+        "type": "day_end_rollup",
+        "day": game.day - 1,
+        "children": [
+            {
+                "name": c.cid,
+                "stress": c.needs["stress"],
+                "lonely": c.needs["lonely"],
+                "energy": c.needs["energy"],
+                "mood": c.mood,
+                "location": c.location,
+            }
+            for c in game.children
+        ],
+        "role_cooldowns": dict(game.role_cooldowns),
+        "policy": dict(game.policy),
+    })
 
 
-def run(days: int, interactive: bool, seed: int) -> None:
+def run(days: int, interactive: bool, seed: int, log_path: str = "") -> None:
     rng = random.Random(seed)
-    game = GameState(day=1, days=days, rng=rng)
+    game = GameState(day=1, days=days, rng=rng, log_path=log_path)
     game.children = build_children(rng)
     game.policy["strict_gate"] = False
+
+    if log_path:
+        append_log(game, {
+            "type": "run_start",
+            "day": game.day,
+            "seed": seed,
+            "days": days,
+            "interactive": interactive,
+            "log_path": log_path,
+        })
 
     for c in game.children:
         game.emperor_perception[c.cid] = {"favor": 0, "suspicion": 0}
@@ -908,6 +1313,21 @@ def run(days: int, interactive: bool, seed: int) -> None:
         print(f"  可见数据: 智{c.visible['wisdom']} 武{c.visible['martial']} 政{c.visible['politics']} 魅{c.visible['charisma']} 威{c.visible['prestige']}")
         print(f"  隐含偏向: 野心{c.hidden['ambition']} 安全{c.hidden['security']} 服从{c.hidden['obedience']} 好奇{c.hidden['curiosity']} 家需求{c.hidden['family_need']}")
         print(f"  状态: 压力{c.needs['stress']} 孤独{c.needs['lonely']} 情绪{c.mood}")
+    append_log(game, {
+        "type": "run_end",
+        "day": game.day - 1,
+        "children": [
+            {
+                "name": c.cid,
+                "route": resolve_route(c),
+                "visible": dict(c.visible),
+                "hidden": dict(c.hidden),
+                "needs": dict(c.needs),
+                "mood": c.mood,
+            }
+            for c in game.children
+        ],
+    })
 
 
 def parse_args() -> argparse.Namespace:
@@ -915,12 +1335,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--days", type=int, default=100)
     p.add_argument("--seed", type=int, default=20260616)
     p.add_argument("--interactive", action="store_true", help="每回合手动输入决策")
+    p.add_argument("--log", type=str, default="", help="每日详细日志文件路径（JSONL），默认不落盘")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run(args.days, args.interactive, args.seed)
+    run(args.days, args.interactive, args.seed, args.log)
 
 
 if __name__ == "__main__":
