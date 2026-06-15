@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.Git
+*.log
+.idea/
+.vscode/
+.md_backups/
