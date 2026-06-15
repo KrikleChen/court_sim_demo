@@ -118,6 +118,44 @@ ROLE_COOLDOWN = {
     },
 }
 
+ACTION_COST = {
+    "太傅": {
+        "辅导": {"command_points": 0},
+        "训诫": {"command_points": 0},
+    },
+    "武师": {
+        "加训": {"command_points": 1},
+        "体能修整": {"command_points": 0},
+    },
+    "母妃": {
+        "安抚": {"command_points": 1},
+        "夜谈": {"command_points": 1},
+    },
+    "太监": {
+        "密查": {"command_points": 0},
+        "警示": {"command_points": 1},
+    },
+    "皇帝": {
+        "召见": {"command_points": 1},
+        "夸奖": {"command_points": 1},
+        "责罚": {"command_points": 2},
+        "赐书": {"command_points": 2},
+        "赐剑": {"command_points": 2},
+        "放宽宫规": {"command_points": 1},
+        "加严宫规": {"command_points": 2},
+        "宴请": {"command_points": 1},
+        "审理": {"command_points": 2},
+    },
+}
+
+EVENT_OPTIONS_COST = {
+    "介入": {"command_points": 1},
+    "平息": {"command_points": 2},
+    "斩责": {"command_points": 2},
+    "调查": {"command_points": 2, "intel": 1},
+    "忽略": {"command_points": 0},
+}
+
 
 @dataclass
 class Memory:
@@ -301,6 +339,15 @@ class GameState:
         "母妃": 0,
         "太监": 0,
     })
+    resources: Dict[str, int] = field(default_factory=lambda: {
+        "command_points": 8,
+        "intel": 3,
+    })
+    resource_caps: Dict[str, int] = field(default_factory=lambda: {
+        "command_points": 12,
+        "intel": 6,
+    })
+    score_history: List[Dict[str, object]] = field(default_factory=list)
 
     def today_stamp(self) -> str:
         return f"第{self.day:03d}日"
@@ -392,6 +439,238 @@ def append_log(game: GameState, record: Dict[str, object]) -> None:
         fp.write("\n")
 
 
+def action_cost(role: str, action: str) -> Dict[str, int]:
+    return dict(ACTION_COST.get(role, {}).get(action, {}))
+
+
+def can_afford(game: GameState, cost: Optional[Dict[str, int]]) -> bool:
+    if not cost:
+        return True
+    return all(game.resources.get(k, 0) >= v for k, v in cost.items())
+
+
+def charge_cost(game: GameState, cost: Optional[Dict[str, int]]) -> bool:
+    if not cost:
+        return True
+    if not can_afford(game, cost):
+        return False
+    for key, value in cost.items():
+        game.resources[key] -= value
+    return True
+
+
+def cost_text(cost: Dict[str, int]) -> str:
+    if not cost:
+        return "0"
+    parts = []
+    for k, v in cost.items():
+        if v > 0:
+            parts.append(f"{k}:{v}")
+    return ", ".join(parts) if parts else "0"
+
+
+def refresh_resources(game: GameState) -> None:
+    for key, cap in game.resource_caps.items():
+        if key == "command_points":
+            game.resources[key] = min(cap, game.resources.get(key, 0) + 2)
+        else:
+            game.resources[key] = min(cap, game.resources.get(key, 0) + 1)
+
+
+def clamp_pct(v: float) -> int:
+    return int(max(0, min(100, round(v))))
+
+
+def child_fate_signal(child: Child) -> Dict[str, int]:
+    rel = child.relation("皇帝")
+    loyalty = clamp_pct((rel.get("信任", 50) + rel.get("亲近", 50) + rel.get("依赖", 50)) / 3)
+    threat = clamp_pct(
+        child.hidden["ambition"] * 0.4
+        + child.hidden["power_desire"] * 0.3
+        + child.hidden["jealousy"] * 0.2
+        + max(0, child.needs["stress"] - 40) * 0.6
+        + max(0, child.needs["lonely"] - 50) * 0.3
+    )
+    merit = clamp_pct((child.visible["wisdom"] + child.visible["martial"] + child.visible["politics"] + child.visible["prestige"]) / 4)
+    claim = clamp_pct(0.55 * loyalty + 0.35 * merit - 0.45 * threat + 40)
+    return {
+        "loyalty": loyalty,
+        "threat": threat,
+        "merit": merit,
+        "claim": claim,
+    }
+
+
+def build_fate_board(game: GameState) -> List[Dict[str, object]]:
+    board = []
+    for c in game.children:
+        s = child_fate_signal(c)
+        board.append({
+            "name": c.cid,
+            "loyalty": s["loyalty"],
+            "threat": s["threat"],
+            "merit": s["merit"],
+            "claim": s["claim"],
+        })
+    return board
+
+
+def draw_incident(game: GameState) -> Optional[Dict[str, object]]:
+    # 触发条件：高嫉妒/高压力/随机宫内传闻
+    if not game.children:
+        return None
+
+    max_lonely = max(game.children, key=lambda c: c.needs["lonely"])
+    max_stress = max(game.children, key=lambda c: c.needs["stress"])
+    target = max_lonely if max_lonely.needs["lonely"] >= max_stress.needs["stress"] else max_stress
+
+    sibling_pair = None
+    for i, left in enumerate(game.children):
+        for right in game.children[i + 1 :]:
+            if left.location == right.location and left.location != "皇子居所" and (left.hidden["jealousy"] > 52 or right.hidden["jealousy"] > 52):
+                sibling_pair = (left, right)
+                break
+        if sibling_pair:
+            break
+
+    if sibling_pair:
+        a, b = sibling_pair
+        return {
+            "type": "宫中争执",
+            "desc": f"{a.name}与{b.name}在{a.location}因争宠与嫉妒发生言语冲突。",
+            "target": a.cid,
+            "options": [
+                {
+                    "id": "介入",
+                    "label": f"派太傅先行调停，先稳住{a.name}和{b.name}",
+                    "cost": dict(EVENT_OPTIONS_COST["介入"]),
+                },
+                {
+                    "id": "审理",
+                    "label": "以皇权发言，公开提醒规矩，严令停手",
+                    "cost": dict(EVENT_OPTIONS_COST["斩责"]),
+                },
+                {
+                    "id": "忽略",
+                    "label": "先不管，观察是否自行平息",
+                    "cost": dict(EVENT_OPTIONS_COST["忽略"]),
+                },
+            ],
+        }
+
+    if target.needs["stress"] >= 78:
+        return {
+            "type": "夜闻异动",
+            "desc": f"{target.name}今日压力接近极值，传出夜间不安征兆，守卫建议加派巡视。",
+            "target": target.cid,
+            "options": [
+                {
+                    "id": "平息",
+                    "label": "下达夜间禁出令，先行安抚",
+                    "cost": dict(EVENT_OPTIONS_COST["平息"]),
+                },
+                {
+                    "id": "调查",
+                    "label": "先用谍报确认后续风险",
+                    "cost": dict(EVENT_OPTIONS_COST["调查"]),
+                },
+                {
+                    "id": "忽略",
+                    "label": "不介入，让太监自行处理",
+                    "cost": dict(EVENT_OPTIONS_COST["忽略"]),
+                },
+            ],
+        }
+
+    if game.rng.random() < 0.28:
+        return {
+            "type": "秘闻传书",
+            "desc": "外来朝报后，太监手中多了一封匿名信：宫中有人暗中挑拨亲疏关系。",
+            "target": target.cid,
+            "options": [
+                {
+                    "id": "调查",
+                    "label": "立即核查信件来源（消耗谍报）",
+                    "cost": dict(EVENT_OPTIONS_COST["调查"]),
+                },
+                {
+                    "id": "介入",
+                    "label": f"命人召见{target.name}面谈，先做情报回流",
+                    "cost": dict(EVENT_OPTIONS_COST["介入"]),
+                },
+                {
+                    "id": "忽略",
+                    "label": "将匿名信归入流言",
+                    "cost": dict(EVENT_OPTIONS_COST["忽略"]),
+                },
+            ],
+        }
+
+    return None
+
+
+def resolve_incident(game: GameState, incident: Dict[str, object], choice_id: str) -> str:
+    if not incident:
+        return "无突发事件"
+    target_cid = incident.get("target")
+    target = next((c for c in game.children if c.cid == target_cid), None)
+    tname = target.name if target else "相关角色"
+
+    if choice_id == "忽略":
+        if target:
+            target.adjust_relation("皇帝", {"信任": -1, "敌意": 1})
+            target.needs["stress"] = min(100, target.needs["stress"] + 4)
+        return f"你选择暂缓处理：{tname}相关矛盾短期未解。"
+
+    if choice_id == "调查":
+        if target:
+            target.needs["stress"] = max(0, target.needs["stress"] - 3)
+            target.adjust_relation("皇帝", {"信任": 2})
+            target.relation("皇帝")["敌意"] -= 1
+            target.adjust_relation("太傅", {"信任": 1})
+            return f"你投入谍报核查{tname}情况，短期化解紧张。"
+        return f"你尝试调查但{tname}相关信息不足，时机被拖延。"
+
+    if incident.get("type") == "夜闻异动":
+        if target:
+            target.needs["stress"] = max(0, target.needs["stress"] - 8)
+            target.adjust_relation("皇帝", {"信任": 3, "亲近": 2})
+            target.needs["energy"] = min(100, target.needs["energy"] + 2)
+        return f"你下达夜规并安抚{tname}，波动先行平息。"
+
+    if incident.get("type") == "宫中争执":
+        if not target:
+            return "未能对冲突主体继续跟进"
+        target.adjust_relation("皇帝", {"信任": 3, "亲近": 2})
+        target.hidden["jealousy"] = max(0, target.hidden["jealousy"] - 8)
+        for c in game.children:
+            if c.cid != target.cid:
+                c.relation(target.cid)["嫉妒"] = max(0, c.relation(target.cid).get("嫉妒", 0) - 2)
+        return f"你令二人暂时停战，{tname}情绪缓和。"
+
+    if incident.get("type") == "秘闻传书":
+        if target:
+            target.adjust_relation("皇帝", {"信任": 2})
+            target.needs["stress"] = max(0, target.needs["stress"] - 2)
+        return f"你以皇命压下流言，{tname}短暂回归正常。"
+
+    return "突发事件暂未形成实质行动"
+
+
+def evaluate_winner(game: GameState) -> str:
+    if not game.children:
+        return "局势空白，无法评估"
+    board = build_fate_board(game)
+    best = max(board, key=lambda c: c["claim"])
+    stable = [x for x in board if x["loyalty"] >= 72 and x["threat"] <= 52 and x["merit"] >= 45]
+
+    danger = [x for x in board if x["threat"] >= 82 and x["loyalty"] <= 44]
+    if danger:
+        return f"局势失稳：{danger[0]['name']}威胁值过高，存在叛逆风险。"
+    if stable:
+        names = "、".join(x["name"] for x in stable)
+        return f"可继承候选明确：{names}，其中核心支持者 {best['name']}（继承力{best['claim']}）"
+    return f"未来未明：{best['name']}最有机会（继承力{best['claim']}）"
 def reduce_role_cooldowns(game: GameState) -> None:
     for role in list(game.role_cooldowns.keys()):
         if game.role_cooldowns[role] > 0:
@@ -483,6 +762,7 @@ def build_emperor_options_for_child(game: GameState, child: Child) -> List[Dict[
     options: List[Dict[str, object]] = []
 
     def append_candidate(action: str, description: str, urgency: int, cooldown: int = 1, extra: Dict[str, int] | None = None) -> None:
+        cost = action_cost("皇帝", action)
         options.append({
             "type": "emperor_child_option",
             "role": "皇帝",
@@ -492,6 +772,7 @@ def build_emperor_options_for_child(game: GameState, child: Child) -> List[Dict[
             "urgency": urgency,
             "cooldown": cooldown,
             "meta": extra or {},
+            "cost": cost,
         })
 
     if child.needs["stress"] >= 70:
@@ -527,6 +808,11 @@ def execute_role_action(game: GameState, option: Dict[str, object]) -> str:
     action = option["action"]
     target_cid = option["target"]
     target = next((c for c in game.children if c.cid == target_cid), None)
+    cost = option.get("cost") or action_cost(role, action)
+
+    if not charge_cost(game, cost):
+        need = ", ".join([f"{k}+{v}" for k, v in (cost or {}).items()])
+        return f"{role}{action}失败：资源不足（需 {need or '0'}）"
 
     if not target:
         return "无效目标，未执行"
@@ -1001,6 +1287,7 @@ def process_delayed_memories(game: GameState, child: Child) -> List[str]:
 
 def apply_intervention_interactive(game: GameState) -> List[str]:
     notes: List[str] = []
+    print(f"\n[今日资源] 命令点={game.resources.get('command_points', 0)}（上限{game.resource_caps.get('command_points', 0)})，谍报点={game.resources.get('intel', 0)}（上限{game.resource_caps.get('intel', 0)})")
     print("\n皇帝自由干预：可分别为每一位角色下达指令（可跳过）")
     for child in game.children:
         options = build_emperor_options_for_child(game, child)
@@ -1011,7 +1298,12 @@ def apply_intervention_interactive(game: GameState) -> List[str]:
 
         for idx, opt in enumerate(options, 1):
             cd = opt["cooldown"]
-            print(f"  {idx}. {opt['description']}（{opt['action']}，冷却 {cd} 天）")
+            cost = opt["cost"]
+            extra = ", ".join([f"{k}:{v}" for k, v in cost.items()]) if cost else "无额外消耗"
+            if not can_afford(game, cost):
+                print(f"  {idx}. {opt['description']}（{opt['action']}，冷却 {cd} 天；消耗{extra}）[预算不足]")
+            else:
+                print(f"  {idx}. {opt['description']}（{opt['action']}，冷却 {cd} 天；消耗{extra}）")
         print("  0. 跳过")
 
         while True:
@@ -1028,6 +1320,9 @@ def apply_intervention_interactive(game: GameState) -> List[str]:
             if choice < 1 or choice > len(options):
                 print("  编号超出范围。")
                 continue
+            if not can_afford(game, options[choice - 1]["cost"]):
+                print("  该指令当前预算不足。")
+                continue
             note = execute_role_action(game, options[choice - 1])
             notes.append(note)
             print(f"  已执行：{note}")
@@ -1043,7 +1338,11 @@ def apply_intervention_auto(game: GameState, options: Optional[List[Dict[str, ob
         options = build_role_candidate_actions(game)
     if not options:
         return "未执行任何干预"
-    return execute_role_action(game, options[0])
+    for opt in options:
+        cost = opt.get("cost") or action_cost(opt["role"], opt["action"])
+        if can_afford(game, cost):
+            return execute_role_action(game, opt)
+    return "未执行任何干预（资源不足）"
 
 
 def resolve_route(child: Child) -> str:
@@ -1076,6 +1375,7 @@ def print_reports(game: GameState, reports: List[Report], child: Child) -> None:
 def day_step(game: GameState, interactive: bool) -> None:
     # 每日开始：轻微自然恢复
     reduce_role_cooldowns(game)
+    refresh_resources(game)
     for c in game.children:
         c.state = "平稳"
         c.needs["energy"] = min(100, c.needs["energy"] + 20)
@@ -1106,7 +1406,7 @@ def day_step(game: GameState, interactive: bool) -> None:
         c.needs["energy"] = max(0, c.needs["energy"])
 
         c.needs["lonely"] += game.rng.randint(0, 3)
-        c.needs["stress"] = max(0, min(100, c.needs["stress" ]))
+        c.needs["stress"] = max(0, min(100, c.needs["stress"]))
 
         c.memories.extend(new_memories)
 
@@ -1148,6 +1448,24 @@ def day_step(game: GameState, interactive: bool) -> None:
     for c in game.children:
         # 与其本人的关系映射
         print(game.character_panel(c))
+
+    board = build_fate_board(game)
+    game.score_history.append({"day": game.day, "board": board})
+    print("\n今日政局指数:")
+    for item in sorted(board, key=lambda x: x["claim"], reverse=True):
+        print(f"  {item['name']}：忠诚 {item['loyalty']:>3d}，威胁 {item['threat']:>3d}，功绩 {item['merit']:>3d}，继承潜力 {item['claim']:>3d}")
+    if any(item["threat"] >= 82 for item in board):
+        print("  警告：检测到高威胁线，若失控将触发叛逆结局。")
+
+    append_log(game, {
+        "type": "day_scoreboard",
+        "day": game.day,
+        "board": board,
+        "resources": {
+            "command_points": game.resources["command_points"],
+            "intel": game.resources["intel"],
+        },
+    })
 
     # 只做核心的简化展示：挑一个有更多事件的孩子展示完整
     for item in day_events:
@@ -1236,7 +1554,63 @@ def day_step(game: GameState, interactive: bool) -> None:
             ],
         })
 
-    # 3) 今日干预（事件卡）
+    # 3) 今日突发事件（叙事）
+    incident = draw_incident(game)
+    incident_log_summary = "无突发事件"
+    if incident:
+        print(f"\n今日突发事件: {incident['type']}")
+        print(f"  {incident['desc']}")
+
+        options = incident["options"]
+        for idx, item in enumerate(options, 1):
+            cost = item["cost"]
+            cost_hint = ", ".join([f"{k}:{v}" for k, v in cost.items()]) if cost else "0"
+            if can_afford(game, cost):
+                print(f"  {idx}. {item['label']}（消耗{cost_hint}）")
+            else:
+                print(f"  {idx}. {item['label']}（消耗{cost_hint}）[预算不足]")
+        print("  0. 跳过")
+
+        if interactive:
+            while True:
+                try:
+                    raw = input("  输入编号: ").strip()
+                except EOFError:
+                    raw = "0"
+                if raw in {"", "0"}:
+                    break
+                if not raw.isdigit():
+                    print("  请输入数字编号。")
+                    continue
+                choice = int(raw)
+                if choice < 1 or choice > len(options):
+                    print("  编号超出范围。")
+                    continue
+                chosen = options[choice - 1]
+                if not can_afford(game, chosen["cost"]):
+                    print("  该处理方式当前预算不足。")
+                    continue
+                if charge_cost(game, chosen["cost"]):
+                    incident_log_summary = resolve_incident(game, incident, chosen["id"])
+                break
+        else:
+            for option in options:
+                if can_afford(game, option["cost"]):
+                    if charge_cost(game, option["cost"]):
+                        incident_log_summary = resolve_incident(game, incident, option["id"])
+                    break
+
+        print(f"  处理结果: {incident_log_summary}")
+
+    append_log(game, {
+        "type": "day_incident",
+        "day": game.day,
+        "incident": incident["type"] if incident else None,
+        "desc": incident["desc"] if incident else None,
+        "result": incident_log_summary,
+    })
+
+    # 4) 今日干预（事件卡）
     options = build_role_candidate_actions(game)
     append_log(game, {
         "type": "day_options",
@@ -1328,6 +1702,7 @@ def day_step(game: GameState, interactive: bool) -> None:
         ],
         "role_cooldowns": dict(game.role_cooldowns),
         "policy": dict(game.policy),
+        "resources": dict(game.resources),
     })
 
 
@@ -1344,6 +1719,8 @@ def run(days: int, interactive: bool, seed: int, log_path: str = "") -> None:
             "seed": seed,
             "days": days,
             "interactive": interactive,
+            "resources": dict(game.resources),
+            "resource_caps": dict(game.resource_caps),
             "log_path": log_path,
         })
 
@@ -1354,6 +1731,8 @@ def run(days: int, interactive: bool, seed: int, log_path: str = "") -> None:
     print("像素符号：")
     print("  E皇帝 A大皇子 B二皇子 C三公主 T太傅 W武师 M母妃 S太监 G侍卫")
     print("  Y御书房 J书院 X校场 U御花园 P母妃宫 Q皇子居所")
+    print("  当前政务目标：在局势中培养继承力高且威胁可控的接班人")
+    print("  今日可支配资源：命令点 +2，谍报点 +1（每日上限恢复）\n")
 
     for _ in range(days):
         if game.day > game.days:
@@ -1362,6 +1741,11 @@ def run(days: int, interactive: bool, seed: int, log_path: str = "") -> None:
 
     print("\n" + "=" * 40)
     print("百天后（或终盘）总结")
+    final_board = build_fate_board(game)
+    final_verdict = evaluate_winner(game)
+    print(f"局势结论: {final_verdict}")
+    for item in sorted(final_board, key=lambda x: x["claim"], reverse=True):
+        print(f"  {item['name']}: 忠诚{item['loyalty']:>3d} 威胁{item['threat']:>3d} 功绩{item['merit']:>3d} 继承力{item['claim']:>3d}")
     for c in game.children:
         r = resolve_route(c)
         print(f"{c.name}: {r}")
@@ -1382,6 +1766,9 @@ def run(days: int, interactive: bool, seed: int, log_path: str = "") -> None:
             }
             for c in game.children
         ],
+        "score_board": final_board,
+        "verdict": final_verdict,
+        "resources": dict(game.resources),
     })
 
 
