@@ -479,6 +479,49 @@ def build_role_candidate_actions(game: GameState) -> List[Dict[str, object]]:
     return filtered[:4]
 
 
+def build_emperor_options_for_child(game: GameState, child: Child) -> List[Dict[str, object]]:
+    options: List[Dict[str, object]] = []
+
+    def append_candidate(action: str, description: str, urgency: int, cooldown: int = 1, extra: Dict[str, int] | None = None) -> None:
+        options.append({
+            "type": "emperor_child_option",
+            "role": "皇帝",
+            "action": action,
+            "target": child.cid,
+            "description": description,
+            "urgency": urgency,
+            "cooldown": cooldown,
+            "meta": extra or {},
+        })
+
+    if child.needs["stress"] >= 70:
+        append_candidate("召见", f"{child.name}压力高，召见以稳定军心", 95, ROLE_COOLDOWN["皇帝"]["召见"])
+    elif child.needs["stress"] <= 35 and not game.policy["strict_gate"]:
+        append_candidate("夸奖", f"{child.name}状态偏稳，公开夸奖可继续提振", 45, ROLE_COOLDOWN["皇帝"]["夸奖"])
+
+    if child.hidden["ambition"] >= 65 and child.visible["martial"] < 60 and child.needs["stress"] >= 55:
+        append_candidate("赐剑", f"以赐剑导向{child.name}的武道竞争冲动", 62, ROLE_COOLDOWN["皇帝"]["赐剑"])
+
+    if child.visible["wisdom"] < 40:
+        append_candidate("赐书", f"{child.name}学业基础偏弱，可赐书助其复习", 55, ROLE_COOLDOWN["皇帝"]["赐书"])
+
+    if child.needs["stress"] >= 80:
+        append_candidate("责罚", f"{child.name}情绪失控且反复，需严肃责罚", 60, ROLE_COOLDOWN["皇帝"]["责罚"])
+
+    if not game.policy["strict_gate"]:
+        append_candidate("放宽宫规", f"{child.name}近期未见重大危机，可尝试放宽宫规", 20, ROLE_COOLDOWN["皇帝"]["放宽宫规"])
+    else:
+        append_candidate("加严宫规", f"当前局势紧绷，维持/提升规矩", 30, ROLE_COOLDOWN["皇帝"]["加严宫规"])
+
+    # 去重+排序
+    unique: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+    for opt in options:
+        unique[(opt["role"], opt["action"], opt["target"])] = opt
+    filtered = list(unique.values())
+    filtered.sort(key=lambda item: item["urgency"], reverse=True)
+    return filtered[:4]
+
+
 def execute_role_action(game: GameState, option: Dict[str, object]) -> str:
     role = option["role"]
     action = option["action"]
@@ -956,34 +999,43 @@ def process_delayed_memories(game: GameState, child: Child) -> List[str]:
     return events
 
 
-def apply_intervention_interactive(game: GameState, options: Optional[List[Dict[str, object]]] = None) -> str:
-    if options is None:
-        options = build_role_candidate_actions(game)
-    print(f"\n今日可下达 {len(options)} 条权责令:")
-    if not options:
-        print("  当前无可执行建议。")
-        return "未执行任何干预"
-
-    for idx, opt in enumerate(options, 1):
-        cd = opt["cooldown"]
-        print(f"  {idx}. [{opt['role']}] {opt['description']}（冷却 {cd} 天）")
-    print("  0. 放弃干预")
-
-    while True:
-        try:
-            raw = input("输入编号: ").strip()
-        except EOFError:
-            raw = "0"
-        if raw in {"", "0"}:
-            return "未执行任何干预"
-        if not raw.isdigit():
-            print("请输入数字编号。")
+def apply_intervention_interactive(game: GameState) -> List[str]:
+    notes: List[str] = []
+    print("\n皇帝自由干预：可分别为每一位角色下达指令（可跳过）")
+    for child in game.children:
+        options = build_emperor_options_for_child(game, child)
+        print(f"\n【{child.name}】")
+        if not options:
+            print("  无可执行建议，跳过。")
             continue
-        choice = int(raw)
-        if choice < 1 or choice > len(options):
-            print("编号超出范围。")
-            continue
-        return execute_role_action(game, options[choice - 1])
+
+        for idx, opt in enumerate(options, 1):
+            cd = opt["cooldown"]
+            print(f"  {idx}. {opt['description']}（{opt['action']}，冷却 {cd} 天）")
+        print("  0. 跳过")
+
+        while True:
+            try:
+                raw = input("  输入编号: ").strip()
+            except EOFError:
+                raw = "0"
+            if raw in {"", "0"}:
+                break
+            if not raw.isdigit():
+                print("  请输入数字编号。")
+                continue
+            choice = int(raw)
+            if choice < 1 or choice > len(options):
+                print("  编号超出范围。")
+                continue
+            note = execute_role_action(game, options[choice - 1])
+            notes.append(note)
+            print(f"  已执行：{note}")
+            break
+
+    if not notes:
+        return ["未执行任何干预"]
+    return notes
 
 
 def apply_intervention_auto(game: GameState, options: Optional[List[Dict[str, object]]] = None) -> str:
@@ -1203,16 +1255,19 @@ def day_step(game: GameState, interactive: bool) -> None:
     })
 
     if interactive:
-        note = apply_intervention_interactive(game, options)
+        action_notes = apply_intervention_interactive(game)
     else:
         note = apply_intervention_auto(game, options)
+        action_notes = [note]
     append_log(game, {
         "type": "day_action",
         "day": game.day,
-        "action": note,
+        "actions": action_notes,
         "options_count": len(options),
     })
-    print(f"皇帝行动: {note}")
+    print("皇帝行动汇总: ")
+    for item in action_notes:
+        print(f"  - {item}")
 
     # 行动点副作用：加严宫规会加大孩子压力/降低出宫事件
     if game.policy["strict_gate"]:
